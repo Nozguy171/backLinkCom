@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:17
+    container_name: linkcom_db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-linkcom}
+      POSTGRES_USER: ${POSTGRES_USER:-linkcom}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-linkcom123}
+    ports:
+      - "${HOST_DB_PORT:-56329}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-linkcom} -d ${POSTGRES_DB:-linkcom}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: linkcom_api
+    env_file:
+      - .env
+    ports:
+      - "${HOST_API_PORT:-51783}:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    command: flask --app run.py run --host=0.0.0.0 --port=5000 --debug
+
+volumes:
+  postgres_data:
