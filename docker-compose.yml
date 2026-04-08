@@ -2,16 +2,17 @@ services:
   db:
     image: postgres:17
     container_name: linkcom_db
+    restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-linkcom}
-      POSTGRES_USER: ${POSTGRES_USER:-linkcom}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-linkcom123}
-    ports:
-      - "${HOST_DB_PORT:-56329}:5432"
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-linkcom} -d ${POSTGRES_DB:-linkcom}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 15
@@ -21,16 +22,16 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: linkcom_api
+    restart: unless-stopped
     env_file:
       - .env
-    ports:
-      - "${HOST_API_PORT:-51783}:5000"
     depends_on:
       db:
         condition: service_healthy
-    volumes:
-      - ./:/app
-    command: flask --app run.py run --host=0.0.0.0 --port=5000 --debug
+    ports:
+      - "127.0.0.1:${HOST_API_PORT:-51783}:5000"
+    command: >
+      sh -c "gunicorn --workers ${GUNICORN_WORKERS:-2} --bind 0.0.0.0:5000 ${GUNICORN_APP:-run:app}"
 
 volumes:
   postgres_data:
