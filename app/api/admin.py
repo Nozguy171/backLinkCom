@@ -1,16 +1,19 @@
-
 from datetime import datetime
 import json
 import uuid
 from decimal import Decimal, InvalidOperation
 
 from flask import Blueprint, jsonify, request
+from flask_jwt_extended import get_jwt_identity
 from slugify import slugify
+from sqlalchemy.orm import joinedload
 
 from app.decorators import admin_required
 from app.extensions import db
 from app.models import (
     Category,
+    ChatConversation,
+    ChatMessage,
     Product,
     Promotion,
     Submission,
@@ -22,7 +25,6 @@ from app.models import (
     VideoSectionLink,
 )
 from app.utils.uploads import save_uploaded_image, save_uploaded_video
-
 admin_bp = Blueprint("admin", __name__)
 
 
@@ -176,6 +178,34 @@ def _title_from_uploaded_filename(filename: str):
         value = value.rsplit(".", 1)[0]
     value = value.strip()
     return value or "Video"
+
+def _serialize_admin_user(user: User):
+    conversation = None
+    if user.conversations:
+        conversation = user.conversations[0]
+
+    messages = list(conversation.messages or []) if conversation else []
+    last_message = None
+    if messages:
+        last_message = max(messages, key=lambda item: item.created_at or datetime.min)
+
+    return {
+        **user.to_dict(),
+        "conversation_id": str(conversation.id) if conversation else None,
+        "messages_count": len(messages),
+        "unread_from_user_count": sum(
+            1 for item in messages if item.sender_role == "user" and not item.is_read
+        ),
+        "last_message_at": (
+            conversation.last_message_at.isoformat()
+            if conversation and conversation.last_message_at
+            else None
+        ),
+        "last_message_preview": (
+            (last_message.content or "")[:120] if last_message else None
+        ),
+        "can_open_chat": user.role == "user",
+    }
 
 @admin_bp.get("/dashboard")
 @admin_required
@@ -686,3 +716,104 @@ def admin_delete_video(video_id):
     db.session.delete(item)
     db.session.commit()
     return jsonify({"message": "Video eliminado correctamente."}), 200
+
+@admin_bp.get("/users")
+@admin_required
+def admin_list_users():
+    q = (request.args.get("q") or "").strip()
+
+    query = (
+        User.query.options(
+            joinedload(User.conversations).joinedload(ChatConversation.messages)
+        )
+        .order_by(User.created_at.desc())
+    )
+
+    if q:
+        search = f"%{q}%"
+        query = query.filter(
+            User.name.ilike(search)
+            | User.email.ilike(search)
+            | User.company.ilike(search)
+            | User.phone.ilike(search)
+        )
+
+    items = query.all()
+    return jsonify({"items": [_serialize_admin_user(item) for item in items]})
+
+
+@admin_bp.patch("/users/<uuid:user_id>")
+@admin_required
+def admin_update_user(user_id):
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"error": "Usuario no encontrado"}), 404
+
+    payload = request.get_json(silent=True) or {}
+
+    name = (payload.get("name") or "").strip()
+    email = (payload.get("email") or "").strip().lower()
+    company = (payload.get("company") or "").strip() or None
+    phone = (payload.get("phone") or "").strip() or None
+    role = payload.get("role")
+    password = (payload.get("password") or "").strip()
+
+    if not name:
+        return jsonify({"error": "El nombre es obligatorio"}), 400
+
+    if not email:
+        return jsonify({"error": "El correo es obligatorio"}), 400
+
+    existing = User.query.filter(User.email == email, User.id != user.id).first()
+    if existing:
+        return jsonify({"error": "Ya existe otro usuario con ese correo"}), 409
+
+    current_admin_id = uuid.UUID(get_jwt_identity())
+
+    if role is not None:
+        role = str(role).strip().lower()
+        if user.id == current_admin_id and role != "admin":
+            return jsonify({"error": "No puedes quitarte el rol de admin a ti mismo"}), 400
+        user.role = role
+
+    user.name = name
+    user.email = email
+    user.company = company
+    user.phone = phone
+
+    if password:
+        if len(password) < 6:
+            return jsonify({"error": "La contraseña debe tener al menos 6 caracteres"}), 400
+        user.set_password(password)
+
+    db.session.commit()
+
+    refreshed = (
+        User.query.options(
+            joinedload(User.conversations).joinedload(ChatConversation.messages)
+        )
+        .filter_by(id=user.id)
+        .first()
+    )
+    return jsonify({"user": _serialize_admin_user(refreshed)}), 200
+
+
+@admin_bp.delete("/users/<uuid:user_id>")
+@admin_required
+def admin_delete_user(user_id):
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"error": "Usuario no encontrado"}), 404
+
+    current_admin_id = uuid.UUID(get_jwt_identity())
+    if user.id == current_admin_id:
+        return jsonify({"error": "No puedes eliminarte a ti mismo"}), 400
+
+    if user.role == "admin":
+        admins_count = User.query.filter_by(role="admin").count()
+        if admins_count <= 1:
+            return jsonify({"error": "No puedes eliminar al último administrador"}), 400
+
+    db.session.delete(user)
+    db.session.commit()
+    return jsonify({"message": "Usuario eliminado correctamente."}), 200

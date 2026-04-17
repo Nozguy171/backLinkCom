@@ -8,42 +8,88 @@ from app.extensions import db
 from app.models import ChatConversation, ChatMessage, User
 
 
-chat_bp = Blueprint('chat', __name__)
+chat_bp = Blueprint("chat", __name__)
 
 
 def _current_user():
     return db.session.get(User, uuid.UUID(get_jwt_identity()))
 
 
-@chat_bp.get('/conversations')
+def _get_conversation_or_404(conversation_id):
+    conversation = ChatConversation.query.filter_by(id=conversation_id).first()
+    if not conversation:
+        return None, (jsonify({"error": "Conversación no encontrada"}), 404)
+    return conversation, None
+
+
+def _ensure_conversation_access(user: User, conversation: ChatConversation):
+    if not user:
+        return jsonify({"error": "Usuario no encontrado"}), 404
+
+    if user.role == "admin":
+        return None
+
+    if conversation.user_id != user.id:
+        return jsonify({"error": "No tienes acceso a esta conversación"}), 403
+
+    return None
+
+
+@chat_bp.get("/conversations")
 @jwt_required()
 def list_conversations():
     claims = get_jwt()
     user_id = uuid.UUID(get_jwt_identity())
 
-    if claims.get('role') == 'admin':
-        conversations = ChatConversation.query.order_by(ChatConversation.last_message_at.desc().nullslast()).all()
+    if claims.get("role") == "admin":
+        conversations = (
+            ChatConversation.query.order_by(
+                ChatConversation.last_message_at.desc().nullslast(),
+                ChatConversation.created_at.desc(),
+            ).all()
+        )
     else:
-        conversations = ChatConversation.query.filter_by(user_id=user_id).order_by(ChatConversation.last_message_at.desc().nullslast()).all()
+        conversations = (
+            ChatConversation.query.filter_by(user_id=user_id)
+            .order_by(
+                ChatConversation.last_message_at.desc().nullslast(),
+                ChatConversation.created_at.desc(),
+            )
+            .all()
+        )
 
-    return jsonify({'items': [conversation.to_dict(include_last_message=True) for conversation in conversations]})
+    return jsonify(
+        {"items": [conversation.to_dict(include_last_message=True) for conversation in conversations]}
+    )
 
 
-@chat_bp.post('/conversations')
+@chat_bp.post("/conversations")
 @jwt_required()
 def create_or_get_conversation():
     user = _current_user()
     if not user:
-        return jsonify({'error': 'Usuario no encontrado'}), 404
+        return jsonify({"error": "Usuario no encontrado"}), 404
 
     payload = request.get_json(silent=True) or {}
-    opening_message = (payload.get('message') or '').strip()
+    opening_message = (payload.get("message") or "").strip()
 
-    if user.role == 'admin':
-        target_user_id = payload.get('user_id')
+    if user.role == "admin":
+        target_user_id = payload.get("user_id")
         if not target_user_id:
-            return jsonify({'error': 'user_id es obligatorio para un admin'}), 400
-        target_user_uuid = uuid.UUID(target_user_id)
+            return jsonify({"error": "user_id es obligatorio para un admin"}), 400
+
+        try:
+            target_user_uuid = uuid.UUID(str(target_user_id))
+        except ValueError:
+            return jsonify({"error": "user_id inválido"}), 400
+
+        target_user = db.session.get(User, target_user_uuid)
+        if not target_user:
+            return jsonify({"error": "Usuario objetivo no encontrado"}), 404
+
+        if target_user.role != "user":
+            return jsonify({"error": "Solo puedes abrir conversaciones de usuarios normales"}), 400
+
         conversation = ChatConversation.query.filter_by(user_id=target_user_uuid).first()
         if not conversation:
             conversation = ChatConversation(user_id=target_user_uuid, assigned_admin_id=user.id)
@@ -52,8 +98,11 @@ def create_or_get_conversation():
     else:
         conversation = ChatConversation.query.filter_by(user_id=user.id).first()
         if not conversation:
-            first_admin = User.query.filter_by(role='admin').order_by(User.created_at.asc()).first()
-            conversation = ChatConversation(user_id=user.id, assigned_admin_id=first_admin.id if first_admin else None)
+            first_admin = User.query.filter_by(role="admin").order_by(User.created_at.asc()).first()
+            conversation = ChatConversation(
+                user_id=user.id,
+                assigned_admin_id=first_admin.id if first_admin else None,
+            )
             db.session.add(conversation)
             db.session.flush()
 
@@ -61,7 +110,7 @@ def create_or_get_conversation():
         message = ChatMessage(
             conversation_id=conversation.id,
             sender_user_id=user.id,
-            sender_role='admin' if user.role == 'admin' else 'user',
+            sender_role="admin" if user.role == "admin" else "user",
             content=opening_message,
             is_read=False,
         )
@@ -69,48 +118,54 @@ def create_or_get_conversation():
         db.session.add(message)
 
     db.session.commit()
-    return jsonify({'conversation': conversation.to_dict(include_last_message=True)}), 201
+    return jsonify({"conversation": conversation.to_dict(include_last_message=True)}), 201
 
 
-@chat_bp.get('/conversations/<uuid:conversation_id>/messages')
+@chat_bp.get("/conversations/<uuid:conversation_id>/messages")
 @jwt_required()
 def list_messages(conversation_id):
     user = _current_user()
-    conversation = ChatConversation.query.filter_by(id=conversation_id).first()
-    if not conversation:
-        return jsonify({'error': 'Conversación no encontrada'}), 404
+    conversation, error = _get_conversation_or_404(conversation_id)
+    if error:
+        return error
 
-    if user.role != 'admin' and conversation.user_id != user.id:
-        return jsonify({'error': 'No tienes acceso a esta conversación'}), 403
+    access_error = _ensure_conversation_access(user, conversation)
+    if access_error:
+        return access_error
 
-    messages = ChatMessage.query.filter_by(conversation_id=conversation_id).order_by(ChatMessage.created_at.asc()).all()
-    return jsonify({'items': [message.to_dict() for message in messages]})
+    messages = (
+        ChatMessage.query.filter_by(conversation_id=conversation_id)
+        .order_by(ChatMessage.created_at.asc())
+        .all()
+    )
+    return jsonify({"items": [message.to_dict() for message in messages]})
 
 
-@chat_bp.post('/conversations/<uuid:conversation_id>/messages')
+@chat_bp.post("/conversations/<uuid:conversation_id>/messages")
 @jwt_required()
 def send_message(conversation_id):
     user = _current_user()
-    conversation = ChatConversation.query.filter_by(id=conversation_id).first()
-    if not conversation:
-        return jsonify({'error': 'Conversación no encontrada'}), 404
+    conversation, error = _get_conversation_or_404(conversation_id)
+    if error:
+        return error
 
-    if user.role != 'admin' and conversation.user_id != user.id:
-        return jsonify({'error': 'No tienes acceso a esta conversación'}), 403
+    access_error = _ensure_conversation_access(user, conversation)
+    if access_error:
+        return access_error
 
     payload = request.get_json(silent=True) or {}
-    content = (payload.get('content') or '').strip()
+    content = (payload.get("content") or "").strip()
 
     if not content:
-        return jsonify({'error': 'El contenido es obligatorio'}), 400
+        return jsonify({"error": "El contenido es obligatorio"}), 400
 
-    if user.role == 'admin' and conversation.assigned_admin_id is None:
+    if user.role == "admin" and conversation.assigned_admin_id is None:
         conversation.assigned_admin_id = user.id
 
     message = ChatMessage(
         conversation_id=conversation.id,
         sender_user_id=user.id,
-        sender_role='admin' if user.role == 'admin' else 'user',
+        sender_role="admin" if user.role == "admin" else "user",
         content=content,
         is_read=False,
     )
@@ -118,25 +173,87 @@ def send_message(conversation_id):
     db.session.add(message)
     db.session.commit()
 
-    return jsonify({'message': message.to_dict()}), 201
+    return jsonify({"message": message.to_dict()}), 201
 
 
-@chat_bp.patch('/conversations/<uuid:conversation_id>/read')
+@chat_bp.patch("/conversations/<uuid:conversation_id>/read")
 @jwt_required()
 def mark_conversation_read(conversation_id):
     user = _current_user()
-    conversation = ChatConversation.query.filter_by(id=conversation_id).first()
-    if not conversation:
-        return jsonify({'error': 'Conversación no encontrada'}), 404
+    conversation, error = _get_conversation_or_404(conversation_id)
+    if error:
+        return error
 
-    if user.role != 'admin' and conversation.user_id != user.id:
-        return jsonify({'error': 'No tienes acceso a esta conversación'}), 403
+    access_error = _ensure_conversation_access(user, conversation)
+    if access_error:
+        return access_error
 
-    sender_role_to_mark = 'user' if user.role == 'admin' else 'admin'
+    sender_role_to_mark = "user" if user.role == "admin" else "admin"
     updated = (
-        ChatMessage.query.filter_by(conversation_id=conversation_id, sender_role=sender_role_to_mark, is_read=False)
-        .update({'is_read': True}, synchronize_session=False)
+        ChatMessage.query.filter_by(
+            conversation_id=conversation_id,
+            sender_role=sender_role_to_mark,
+            is_read=False,
+        ).update({"is_read": True}, synchronize_session=False)
     )
     db.session.commit()
 
-    return jsonify({'updated': updated})
+    return jsonify({"updated": updated})
+
+
+@chat_bp.patch("/messages/<uuid:message_id>")
+@jwt_required()
+def admin_edit_message(message_id):
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Usuario no encontrado"}), 404
+
+    if user.role != "admin":
+        return jsonify({"error": "Solo un administrador puede editar mensajes"}), 403
+
+    message = db.session.get(ChatMessage, message_id)
+    if not message:
+        return jsonify({"error": "Mensaje no encontrado"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    content = (payload.get("content") or "").strip()
+
+    if not content:
+        return jsonify({"error": "El contenido es obligatorio"}), 400
+
+    if message.is_deleted:
+        return jsonify({"error": "No puedes editar un mensaje eliminado"}), 409
+
+    message.content = content
+    message.is_edited = True
+    message.edited_at = datetime.now(timezone.utc)
+
+    db.session.commit()
+    return jsonify({"message": message.to_dict()}), 200
+
+
+@chat_bp.delete("/messages/<uuid:message_id>")
+@jwt_required()
+def admin_delete_message(message_id):
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Usuario no encontrado"}), 404
+
+    if user.role != "admin":
+        return jsonify({"error": "Solo un administrador puede eliminar mensajes"}), 403
+
+    message = db.session.get(ChatMessage, message_id)
+    if not message:
+        return jsonify({"error": "Mensaje no encontrado"}), 404
+
+    if message.is_deleted:
+        return jsonify({"message": message.to_dict()}), 200
+
+    message.content = "Un administrador eliminó este mensaje"
+    message.is_deleted = True
+    message.deleted_at = datetime.now(timezone.utc)
+    message.is_edited = False
+    message.edited_at = None
+
+    db.session.commit()
+    return jsonify({"message": message.to_dict()}), 200

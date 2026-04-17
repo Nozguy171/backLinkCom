@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import time
+import uuid
 from datetime import UTC, datetime
 
 from flask import Blueprint, jsonify, request
@@ -185,10 +186,55 @@ def register():
 @auth_bp.get("/me")
 @jwt_required()
 def me():
-    user_id = get_jwt_identity()
+    user_id = uuid.UUID(str(get_jwt_identity()))
     user = db.session.get(User, user_id)
 
     if not user:
         return jsonify({"message": "Usuario no encontrado."}), 404
 
     return jsonify({"user": _user_payload(user)}), 200
+
+
+@auth_bp.patch("/me")
+@jwt_required()
+def update_me():
+    user_id = uuid.UUID(str(get_jwt_identity()))
+    user = db.session.get(User, user_id)
+
+    if not user:
+        return jsonify({"message": "Usuario no encontrado."}), 404
+
+    data = request.get_json(silent=True) or {}
+
+    name = (data.get("name") or "").strip()
+    email = _normalize_email(data.get("email", ""))
+    company = (data.get("company") or "").strip() or None
+    phone = (data.get("phone") or "").strip() or None
+    password = (data.get("password") or "").strip()
+
+    if not name:
+        return jsonify({"message": "El nombre es obligatorio."}), 400
+
+    if not email:
+        return jsonify({"message": "El correo es obligatorio."}), 400
+
+    existing = User.query.filter(User.email == email, User.id != user.id).first()
+    if existing:
+        return jsonify({"message": "Ese correo ya está en uso."}), 409
+
+    user.name = name
+    user.email = email
+    user.company = company
+    user.phone = phone
+
+    if password:
+        if len(password) < 6:
+            return jsonify({"message": "La contraseña debe tener al menos 6 caracteres."}), 400
+        user.set_password(password)
+
+    db.session.commit()
+
+    return jsonify({
+        "message": "Perfil actualizado correctamente.",
+        "user": _user_payload(user),
+    }), 200
